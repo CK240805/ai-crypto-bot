@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+python-telegram-bot
+oandapyV20
+openai
+requests
+schedule
+mcp
+httpx
+anyio
