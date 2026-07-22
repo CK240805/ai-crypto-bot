@@ -8,3 +8,4 @@ schedule
 mcp
 httpx
 anyio
+six
