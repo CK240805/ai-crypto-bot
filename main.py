@@ -41,36 +41,29 @@ app = FastAPI()
 def read_root():
     return {"status": "AI Trading Bot is running 24/7!"}
 
-# --- NEW: FETCH OANDA INSTRUMENTS ---
+# --- FETCH OANDA INSTRUMENTS ---
 async def get_oanda_instruments():
-    """Fetches all tradable instruments from the OANDA account."""
     try:
         r = accounts.AccountInstruments(accountID=OANDA_ACCOUNT_ID)
         oanda.request(r)
         instruments = r.response['instruments']
-        # Extract instrument names (e.g., 'EUR_USD')
         return [inst['name'] for inst in instruments]
     except Exception as e:
-        print(f"⚠️ Failed to fetch OANDA instruments: {e}. Using fallback list.")
-        # Safe fallback to prevent crashes
+        print(f"⚠️ Failed to fetch OANDA instruments: {e}. Using fallback.")
         return ['EUR_USD', 'GBP_USD', 'USD_JPY', 'AUD_USD', 'XAU_USD']
 
-# --- CORE BOT FUNCTIONS ---
+# --- FIXED GENERATION FUNCTION ---
 async def generate_strategy_from_deepseek():
-    # 1. Fetch available instruments
     available_instruments = await get_oanda_instruments()
     instruments_str = ", ".join(available_instruments)
-    
-    # 2. Prompt DeepSeek to choose ONE instrument from the list
     prompt = f"""
     I have an OANDA account. I can only trade these instruments: {instruments_str}.
-    
     Your task:
     1. Analyze the market and choose exactly ONE instrument from this list.
     2. Determine if the market is bullish or bearish for it.
-    3. Output a JSON structure with the following keys:
+    3. Output a JSON structure with:
     {{
-        "symbol": "The exact instrument you chose from the list above (e.g., EUR_USD)",
+        "symbol": "The exact instrument chosen from the list (e.g., EUR_USD)",
         "signal_direction": "BUY" or "SELL",
         "entry_condition": "e.g., RSI < 30 and price_above_SMA_50",
         "exit_condition": "e.g., RSI > 70 or price_below_SMA_50",
@@ -78,32 +71,29 @@ async def generate_strategy_from_deepseek():
         "stop_loss_pct": 0.02,
         "take_profit_pct": 0.04
     }}
-    Output only the valid JSON. Do not use markdown backticks. Use exactly the OANDA symbol format.
+    Output only valid JSON. No markdown backticks.
     """
-    response = client.chat.completions.create(
-        model=NVIDIA_MODEL_NAME,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.7
-    )
     try:
-        strategy = json.loads(response.choices[0].message.content.strip())
-        # Safety check: If AI hallucinated an invalid symbol, force fallback to EUR_USD
+        # Now the API call is INSIDE the try block
+        response = client.chat.completions.create(
+            model=NVIDIA_MODEL_NAME,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7
+        )
+        content = response.choices[0].message.content.strip()
+        strategy = json.loads(content)
         if strategy.get("symbol") not in available_instruments:
-            print(f"⚠️ DeepSeek invented symbol {strategy.get('symbol')}! Forcing fallback to EUR_USD.")
             strategy["symbol"] = "EUR_USD"
         return strategy
-    except:
-        # Fallback default strategy if parsing fails
+    except Exception as e:
+        # This catches the 404 error and prevents the crash
+        print(f"❌ DeepSeek/NVIDIA API Error: {e}. Falling back to default strategy.")
         return {"symbol": "EUR_USD", "signal_direction": "BUY", "entry_condition": "EMA_50_cross", "stop_loss_pct": 0.02, "take_profit_pct": 0.05}
 
 async def run_backtest_on_trader_dev(strategy_params):
-    print("📡 Attempting to connect to MCP Server...")
     auth_headers = None
     if TRADER_DEV_API_KEY and TRADER_DEV_API_KEY.strip() != "":
         auth_headers = {"Authorization": f"Bearer {TRADER_DEV_API_KEY}"}
-    else:
-        print("⚠️  No TRADER_DEV_API_KEY found. Will simulate.")
-
     try:
         async with sse_client(MCP_SERVER_URL, headers=auth_headers) as streams:
             async with mcp.ClientSession(*streams) as session:
@@ -115,62 +105,41 @@ async def run_backtest_on_trader_dev(strategy_params):
                         backtest_tool = tool
                         break
                 if not backtest_tool:
-                    raise Exception("No 'backtest' tool found on the MCP server.")
-                
-                print(f"✅ Connected! Found MCP tool: {backtest_tool.name}")
-                
-                # Pass the entire strategy (which now includes 'symbol')
-                response = await session.call_tool(
-                    backtest_tool.name,
-                    arguments={"strategy": json.dumps(strategy_params)} 
-                )
-
+                    raise Exception("No 'backtest' tool found.")
+                response = await session.call_tool(backtest_tool.name, arguments={"strategy": json.dumps(strategy_params)})
                 if response.content and len(response.content) > 0:
                     return json.loads(response.content[0].text)
                 raise Exception("Empty response")
-
     except Exception as e:
-        print(f"❌ MCP Error: {e}. Using simulation fallback.")
-        return {
-            "sharpe_ratio": random.uniform(0.5, 2.5),
-            "profit_pct": random.uniform(-5, 15),
-            "max_drawdown": random.uniform(1, 10),
-            "status": "fallback"
-        }
+        print(f"❌ MCP Error: {e}. Using simulation.")
+        return {"sharpe_ratio": random.uniform(0.5, 2.5), "profit_pct": random.uniform(-5, 15), "max_drawdown": random.uniform(1, 10), "status": "fallback"}
 
 async def refine_strategy_with_deepseek(previous_strategy, backtest_results):
     failures = f"Sharpe was {backtest_results['sharpe_ratio']}, drawdown was {backtest_results['max_drawdown']}%."
     prompt = f"""
-    The following strategy for {previous_strategy['symbol']} failed backtesting: {previous_strategy}. 
+    The following strategy for {previous_strategy['symbol']} failed: {previous_strategy}. 
     Reason: {failures}
-    Keep the exact symbol "{previous_strategy['symbol']}" fixed. Adjust only the 'entry_condition', 'stop_loss_pct', and 'take_profit_pct' to improve Sharpe ratio above 2.0.
-    Return the updated JSON in the exact same format.
+    Keep symbol "{previous_strategy['symbol']}" fixed. Adjust 'entry_condition', 'stop_loss_pct', 'take_profit_pct' to improve Sharpe ratio above 2.0.
+    Return updated JSON in the exact same format.
     """
-    response = client.chat.completions.create(
-        model=NVIDIA_MODEL_NAME,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.8
-    )
     try:
+        response = client.chat.completions.create(model=NVIDIA_MODEL_NAME, messages=[{"role": "user", "content": prompt}], temperature=0.8)
         refined = json.loads(response.choices[0].message.content.strip())
-        # Ensure the symbol stays consistent, as AI might forget it
         refined["symbol"] = previous_strategy["symbol"]
         return refined
     except:
         return previous_strategy
 
 async def execute_trade(symbol, signal_direction, sl_price, tp_price):
-    # Get account balance
     r = accounts.AccountSummary(accountID=OANDA_ACCOUNT_ID)
     oanda.request(r)
     account_balance = float(r.response['account']['balance'])
     usable_capital = min(MAX_CAPITAL, account_balance)
     trade_units = int(usable_capital / 1.10) 
-    
     order_data = {
         "order": {
             "type": "MARKET",
-            "instrument": symbol,  # DYNAMIC SYMBOL HERE
+            "instrument": symbol,
             "units": str(trade_units if signal_direction == "BUY" else -trade_units),
             "stopLossOnFill": {"price": str(sl_price)},
             "takeProfitOnFill": {"price": str(tp_price)}
@@ -185,50 +154,29 @@ async def execute_trade(symbol, signal_direction, sl_price, tp_price):
 
 async def find_amazing_strategy_loop():
     while True:
-        print("🔄 Loop: Generating strategy via NVIDIA...")
         strategy = await generate_strategy_from_deepseek()
-        print(f"AI selected: {strategy['symbol']} | Backtesting: {strategy}")
         backtest_result = await run_backtest_on_trader_dev(strategy)
-        
         is_amazing = (backtest_result['sharpe_ratio'] > 1.8 and backtest_result['max_drawdown'] < 5.0)
-        
         if is_amazing:
-            print(f"✅ AMAZING STRATEGY FOUND for {strategy['symbol']}!")
-            # Calculate SL/TP assuming a mid-price - can fetch latest price via OANDA here for precision
-            # For dynamic safety, we will simulate a base price of 1.1000, but you can replace this with a live price fetch
             base_price = 1.1000 
             sl_price = base_price - (base_price * strategy['stop_loss_pct'])
             tp_price = base_price + (base_price * strategy['take_profit_pct'])
-            
-            execution = await execute_trade(
-                strategy['symbol'], 
-                strategy['signal_direction'], 
-                round(sl_price, 4), 
-                round(tp_price, 4)
-            )
-            await telegram_bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID, 
-                text=f"🚀 Bot executing trade!\nSymbol: {execution['symbol']}\nDirection: {strategy['signal_direction']}\nResult: {execution}"
-            )
+            execution = await execute_trade(strategy['symbol'], strategy['signal_direction'], round(sl_price, 4), round(tp_price, 4))
+            await telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"🚀 Executed trade!\nSymbol: {execution['symbol']}\nDirection: {strategy['signal_direction']}\nResult: {execution}")
         else:
-            print(f"❌ Not amazing. Asking DeepSeek to refine for {strategy['symbol']}...")
             strategy = await refine_strategy_with_deepseek(strategy, backtest_result)
-        
-        await asyncio.sleep(300) # 5 mins
+        await asyncio.sleep(300)
 
 async def send_morning_report():
     prompt = "Give a 3-sentence summary of today's expected market sentiment and key volatility levels for major currencies."
-    response = client.chat.completions.create(model=NVIDIA_MODEL_NAME, messages=[{"role":"user", "content": prompt}])
-    await telegram_bot.send_message(
-        chat_id=TELEGRAM_CHAT_ID, 
-        text=f"🌅 Morning Market Analysis:\n\n{response.choices[0].message.content}"
-    )
+    try:
+        response = client.chat.completions.create(model=NVIDIA_MODEL_NAME, messages=[{"role":"user", "content": prompt}])
+        await telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"🌅 Morning Analysis:\n\n{response.choices[0].message.content}")
+    except:
+        await telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🌅 Morning Analysis: Could not reach AI API. Please check NVIDIA keys.")
 
 async def send_night_performance():
-    await telegram_bot.send_message(
-        chat_id=TELEGRAM_CHAT_ID, 
-        text=f"🌙 Night Performance Profile:\nToday's P&L: $-2.50 (Simulated)\nOpen Positions: 1"
-    )
+    await telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"🌙 Night Profile:\nToday's P&L: $-2.50 (Simulated)\nOpen Positions: 1")
 
 async def background_worker():
     schedule.every().day.at("09:00").do(lambda: asyncio.create_task(send_morning_report()))
@@ -242,5 +190,7 @@ async def background_worker():
 async def startup_event():
     threading.Thread(target=lambda: asyncio.run(background_worker()), daemon=True).start()
 
+# --- RUN THE APP ---
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    port = int(os.getenv("PORT", 8080))
+    uvicorn.run(app, host="0.0.0.0", port=port)
