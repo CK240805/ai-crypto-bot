@@ -7,6 +7,7 @@ import threading
 import mcp
 from mcp.client.sse import sse_client
 from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
 import uvicorn
 from oandapyV20 import API
 from oandapyV20.endpoints import accounts, orders
@@ -34,12 +35,50 @@ client = openai.OpenAI(
 oanda = API(access_token=OANDA_API_KEY, environment="practice")
 telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
+# --- DASHBOARD DATA STORAGE ---
+INTERACTION_HISTORY = [] # Stores the last 20 interactions
+
 # --- FASTAPI APP ---
 app = FastAPI()
 
 @app.get("/")
 def read_root():
     return {"status": "AI Trading Bot is running 24/7!"}
+
+# --- NEW DASHBOARD ENDPOINT ---
+@app.get("/dashboard", response_class=HTMLResponse)
+async def get_dashboard():
+    html_content = """
+    <html>
+        <head><title>AI Bot Dashboard</title>
+        <style>body{font-family:sans-serif;background:#121212;color:#eee;padding:20px;} 
+        .entry{background:#1e1e1e;border:1px solid #333;border-radius:8px;padding:15px;margin-bottom:20px;}
+        .label{font-weight:bold;color:#4fc3f7;margin-top:10px;}
+        .json-block{background:#000;padding:10px;border-radius:4px;font-family:monospace;white-space:pre-wrap;overflow-x:auto;}
+        .time{color:#888;font-size:0.85em;}
+        </style></head>
+        <body>
+        <h1>🤖 AI Trading Bot - Interaction Dashboard</h1>
+        <p>Showing the last 20 requests to DeepSeek and their responses.</p>
+        <hr>
+    """
+    
+    if not INTERACTION_HISTORY:
+        html_content += "<p><i>No interactions logged yet. Waiting for the next 5-minute loop...</i></p>"
+    else:
+        for idx, entry in enumerate(reversed(INTERACTION_HISTORY)):
+            html_content += f"""
+            <div class="entry">
+                <div class="time">[{entry['timestamp']}]</div>
+                <div class="label">🤖 Bot Prompt:</div>
+                <div class="json-block">{entry['prompt']}</div>
+                <div class="label">🧠 DeepSeek Response:</div>
+                <div class="json-block">{entry['response']}</div>
+            </div>
+            """
+    
+    html_content += "</body></html>"
+    return HTMLResponse(content=html_content)
 
 # --- FETCH OANDA INSTRUMENTS ---
 async def get_oanda_instruments():
@@ -52,7 +91,6 @@ async def get_oanda_instruments():
         print(f"⚠️ Failed to fetch OANDA instruments: {e}. Using fallback.")
         return ['EUR_USD', 'GBP_USD', 'USD_JPY', 'AUD_USD', 'XAU_USD']
 
-# --- FIXED GENERATION FUNCTION ---
 async def generate_strategy_from_deepseek():
     available_instruments = await get_oanda_instruments()
     instruments_str = ", ".join(available_instruments)
@@ -74,19 +112,28 @@ async def generate_strategy_from_deepseek():
     Output only valid JSON. No markdown backticks.
     """
     try:
-        # Now the API call is INSIDE the try block
         response = client.chat.completions.create(
             model=NVIDIA_MODEL_NAME,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.7
         )
         content = response.choices[0].message.content.strip()
+        
+        # Save to dashboard history
+        from datetime import datetime
+        INTERACTION_HISTORY.append({
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "prompt": prompt,
+            "response": content
+        })
+        if len(INTERACTION_HISTORY) > 20:
+            INTERACTION_HISTORY.pop(0)
+
         strategy = json.loads(content)
         if strategy.get("symbol") not in available_instruments:
             strategy["symbol"] = "EUR_USD"
         return strategy
     except Exception as e:
-        # This catches the 404 error and prevents the crash
         print(f"❌ DeepSeek/NVIDIA API Error: {e}. Falling back to default strategy.")
         return {"symbol": "EUR_USD", "signal_direction": "BUY", "entry_condition": "EMA_50_cross", "stop_loss_pct": 0.02, "take_profit_pct": 0.05}
 
@@ -124,7 +171,19 @@ async def refine_strategy_with_deepseek(previous_strategy, backtest_results):
     """
     try:
         response = client.chat.completions.create(model=NVIDIA_MODEL_NAME, messages=[{"role": "user", "content": prompt}], temperature=0.8)
-        refined = json.loads(response.choices[0].message.content.strip())
+        content = response.choices[0].message.content.strip()
+        
+        # Save to dashboard history
+        from datetime import datetime
+        INTERACTION_HISTORY.append({
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "prompt": prompt,
+            "response": content
+        })
+        if len(INTERACTION_HISTORY) > 20:
+            INTERACTION_HISTORY.pop(0)
+
+        refined = json.loads(content)
         refined["symbol"] = previous_strategy["symbol"]
         return refined
     except:
